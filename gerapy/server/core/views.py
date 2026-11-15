@@ -5,7 +5,6 @@ import base64
 import json
 import os
 import requests
-import time
 import pytz
 import pymongo
 from shutil import rmtree
@@ -16,7 +15,6 @@ from django.core.serializers import serialize
 from django.http import HttpResponse
 from django.forms.models import model_to_dict
 from django.utils import timezone
-from django.db import transaction
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from subprocess import Popen, PIPE
@@ -24,8 +22,16 @@ from gerapy import get_logger
 from gerapy.server.core.response import JsonResponse
 from gerapy.cmd.init import PROJECTS_FOLDER
 from gerapy.server.server.settings import TIME_ZONE
-from gerapy.server.core.models import Client, Project, Deploy, Monitor, Task
+from gerapy.server.core.models import Client, Project, Deploy, Monitor, Task, DeploymentRecord
 from gerapy.server.core.build import build_project, find_egg
+from gerapy.server.core.deployment import (
+    VersionStore, DeploymentEngine, DeployLogger, ConcurrentDeploymentError,
+    DeploymentError, sanitize as sanitize_text, truncate as truncate_text,
+    diff_manifests, read_manifest,
+    check_daemon_health, get_running_jobs, existing_versions,
+    DEFAULT_RUNNING_POLICY, POLICY_ABORT, POLICY_CONTINUE, POLICY_WAIT,
+    prune_records, rotate_deploy_logs,
+)
 from gerapy.server.core.utils import IGNORES, is_in_curdir, scrapyd_url, log_url, get_tree, get_scrapyd, process_html, bytes2str, \
     clients_of_task, get_job_id, log_exception, is_safe_url
 from django_apscheduler.models import DjangoJob, DjangoJobExecution
@@ -452,34 +458,129 @@ def project_version(request, client_id, project_name):
 def project_deploy(request, client_id, project_name):
     """
     deploy project operation
-    :param request: request object
-    :param client_id: client id
-    :param project_name: project name
-    :return: json of deploy result
+
+    Backward-compatible endpoint: by default it keeps the historical
+    single-version behaviour (keep_versions=1, running jobs continue on their
+    loaded egg). The deployment itself now goes through the versioned engine:
+    an immutable build is created, health-checked under a staging version and
+    atomically switched; any failure rolls back automatically and leaves the
+    previous version active.
     """
     if request.method == 'POST':
-        # get project folder
-        path = os.path.abspath(join(os.getcwd(), PROJECTS_FOLDER))
-        project_path = join(path, project_name)
-        # find egg file
-        egg = find_egg(project_path)
-        if not egg:
-            return JsonResponse({'message': 'egg not found'}, status=500)
-        egg_file = open(join(project_path, egg), 'rb')
-        # get client and project model
+        payload = parse_json_body(request)
+        # default deployment keeps exactly one active version, as before
+        keep_versions = int(payload.get('keep_versions', 1))
+        running_policy = payload.get('running_policy', DEFAULT_RUNNING_POLICY)
+        description = payload.get('description')
+        return _execute_deploy(request, client_id, project_name,
+                               keep_versions=keep_versions,
+                               running_policy=running_policy,
+                               description=description,
+                               version=payload.get('version'))
+
+
+def parse_json_body(request):
+    """tolerant JSON body parser; never raises on empty/non-json input"""
+    if not request.body:
+        return {}
+    try:
+        data = json.loads(request.body)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def current_operator(request):
+    """the authenticated user behind a deployment, for the audit trail"""
+    user = getattr(request, 'user', None)
+    if user and getattr(user, 'is_authenticated', False):
+        return user.get_username()
+    return None
+
+
+def _execute_deploy(request, client_id, project_name, *, keep_versions, running_policy,
+                    description, version=None, expected_spiders=None,
+                    enforce_data_compatibility=True):
+    """
+    shared deploy path used by both the legacy endpoint and the versioned API.
+    Creates the audit row up front so even rejected/failed attempts are
+    recorded, then hands control to the DeploymentEngine.
+    """
+    try:
         client = Client.objects.get(id=client_id)
-        project = Project.objects.get(name=project_name)
-        # execute deploy operation
-        scrapyd = get_scrapyd(client)
-        scrapyd.add_version(project_name, int(time.time()), egg_file.read())
-        # update deploy info atomically to avoid a race between concurrent
-        # deployments that could violate the (client, project) unique constraint
-        deployed_at = timezone.now()
-        with transaction.atomic():
-            deploy, result = Deploy.objects.update_or_create(
-                client=client, project=project,
-                defaults={'deployed_at': deployed_at, 'description': project.description})
-        return JsonResponse(model_to_dict(deploy))
+    except Client.DoesNotExist:
+        return JsonResponse({'message': 'client not found'}, status=404)
+    # a project may exist on disk before it has a Project row (the historical
+    # flow), so this is a soft warning logged on the record rather than a 404
+    if not Project.objects.filter(name=project_name):
+        Project.objects.get_or_create(name=project_name)
+
+    record = DeploymentRecord.objects.create(
+        client=client, client_name=client.name, project=project_name,
+        status=DeploymentRecord.DEPLOYING, operator=current_operator(request),
+        running_task_policy=running_policy)
+    store = VersionStore()
+    engine = DeploymentEngine(store)
+    try:
+        # build (or reuse an immutable version) unless a specific ready version
+        # was requested
+        if not version:
+            project_version, _created = store.build(
+                project_name, description=description,
+                build_logger=DeployLogger(record.id))
+            version = project_version.version
+        else:
+            project_version = store.get(project_name, version)
+            if not project_version:
+                record.status = DeploymentRecord.FAILED
+                record.reason = DeploymentRecord.REASON_BUILD_FAILED
+                record.rollback_reason = 'requested version %s not found' % version
+                record.finished_at = timezone.now()
+                record.save()
+                prune_records()
+                return JsonResponse({'message': 'version not found', 'record_id': record.id}, status=404)
+        result = engine.deploy(
+            client, project_name, version,
+            operator=current_operator(request),
+            running_policy=running_policy,
+            keep_versions=keep_versions,
+            expected_spiders=expected_spiders,
+            enforce_data_compatibility=enforce_data_compatibility,
+            record=record)
+    except ConcurrentDeploymentError as e:
+        record.status = DeploymentRecord.REJECTED
+        record.reason = DeploymentRecord.REASON_CONCURRENT
+        record.rollback_reason = truncate_text(sanitize_text(str(e)))
+        record.finished_at = timezone.now()
+        record.save()
+        prune_records()
+        return JsonResponse({'message': str(e), 'status': DeploymentRecord.REJECTED,
+                             'record_id': record.id}, status=409)
+    except DeploymentError as e:
+        # engine normally records failures itself; this covers failures raised
+        # before the engine took ownership (e.g. during build)
+        if record.status == DeploymentRecord.DEPLOYING:
+            record.status = DeploymentRecord.FAILED
+            record.reason = e.reason
+            record.rollback_reason = truncate_text(sanitize_text(str(e)))
+            record.finished_at = timezone.now()
+            record.save()
+            prune_records()
+        return JsonResponse({'message': str(e), 'status': record.status,
+                             'reason': record.reason, 'record_id': record.id}, status=500)
+
+    if result.status == DeploymentRecord.SUCCESS:
+        deploy = Deploy.objects.filter(client=client, project=Project.objects.get(name=project_name)).first()
+        data = model_to_dict(deploy) if deploy else {'record_id': result.id}
+        data['record_id'] = result.id
+        data['version'] = result.version
+        data['status'] = result.status
+        return JsonResponse(data)
+    return JsonResponse(
+        {'message': result.rollback_reason or 'deployment failed',
+         'status': result.status, 'reason': result.reason,
+         'record_id': result.id, 'previous_version': result.previous_version},
+        status=500)
 
 
 @log_exception()
@@ -969,6 +1070,285 @@ def task_status(request, task_id):
                 'executions': json.loads(executions)
             })
         return JsonResponse({'data': result})
+
+
+@log_exception()
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def project_version_build(request, project_name):
+    """
+    build (or reuse) an immutable version of a project, or list existing
+    versions. A build never mutates the active deployment: it only produces a
+    content-addressed artifact under VERSIONS_FOLDER.
+    """
+    store = VersionStore()
+    if request.method == 'GET':
+        versions = [
+            {'id': v.id, 'project': v.project, 'version': v.version,
+             'checksum': v.checksum, 'size': v.size, 'description': v.description,
+             'build_status': v.build_status, 'built_at': v.built_at,
+             'created_at': v.created_at}
+            for v in store.list_versions(project_name)
+        ]
+        return JsonResponse({'result': '1', 'data': versions})
+
+    data = parse_json_body(request)
+    description = data.get('description')
+    record = DeploymentRecord.objects.create(
+        project=project_name, status=DeploymentRecord.DEPLOYING,
+        operator=current_operator(request))
+    log = DeployLogger(record.id)
+    try:
+        project_version, created = store.build(project_name, description=description, build_logger=log)
+    except DeploymentError as e:
+        record.status = DeploymentRecord.FAILED
+        record.reason = e.reason
+        record.version = None
+        record.rollback_reason = truncate_text(sanitize_text(str(e)))
+        record.log = log.content()
+        record.log_path = log.path
+        record.finished_at = timezone.now()
+        record.save()
+        rotate_deploy_logs()
+        prune_records()
+        return JsonResponse({'message': str(e), 'reason': e.reason,
+                             'record_id': record.id}, status=500)
+    record.version = project_version.version
+    record.status = DeploymentRecord.SUCCESS
+    record.reason = None
+    record.rollback_reason = 'build only, no deployment' if not created else 'new immutable version built'
+    record.log = log.content()
+    record.log_path = log.path
+    record.finished_at = timezone.now()
+    record.save()
+    rotate_deploy_logs()
+    prune_records()
+    return JsonResponse({'result': '1', 'reused': not created,
+                         'version': project_version.version,
+                         'checksum': project_version.checksum, 'size': project_version.size,
+                         'record_id': record.id})
+
+
+@log_exception()
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def project_version_upload(request, project_name):
+    """
+    register an uploaded egg as an immutable, content-addressed version
+    without touching the active deployment
+    """
+    if 'file' not in request.FILES:
+        return JsonResponse({'message': 'egg file is required'}, status=400)
+    egg_bytes = request.FILES['file'].read()
+    if not egg_bytes:
+        return JsonResponse({'message': 'uploaded egg is empty'}, status=400)
+    data = parse_json_body(request)
+    description = data.get('description') or request.POST.get('description')
+    store = VersionStore()
+    record = DeploymentRecord.objects.create(
+        project=project_name, status=DeploymentRecord.DEPLOYING,
+        operator=current_operator(request))
+    log = DeployLogger(record.id)
+    try:
+        project_version, created = store.build(
+            project_name, description=description, egg_bytes=egg_bytes, build_logger=log)
+    except DeploymentError as e:
+        record.status = DeploymentRecord.FAILED
+        record.reason = e.reason
+        record.rollback_reason = truncate_text(sanitize_text(str(e)))
+        record.log = log.content()
+        record.log_path = log.path
+        record.finished_at = timezone.now()
+        record.save()
+        rotate_deploy_logs()
+        prune_records()
+        return JsonResponse({'message': str(e), 'reason': e.reason,
+                             'record_id': record.id}, status=500)
+    record.version = project_version.version
+    record.status = DeploymentRecord.SUCCESS
+    record.rollback_reason = 'egg uploaded, no deployment'
+    record.log = log.content()
+    record.log_path = log.path
+    record.finished_at = timezone.now()
+    record.save()
+    rotate_deploy_logs()
+    prune_records()
+    return JsonResponse({'result': '1', 'reused': not created,
+                         'version': project_version.version,
+                         'checksum': project_version.checksum,
+                         'size': project_version.size, 'record_id': record.id})
+
+
+@log_exception()
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def project_version_deploy(request, client_id, project_name, version):
+    """
+    deploy a specific immutable version with explicit retention and running-job
+    policy. Body options:
+      keep_versions: int (default 1, the historical single-version behaviour)
+      running_policy: wait | continue | abort (default continue)
+      expected_spiders: optional list used as an extra health assertion
+      enforce_data_compatibility: bool (default true)
+    """
+    data = parse_json_body(request)
+    keep_versions = int(data.get('keep_versions', 1))
+    running_policy = data.get('running_policy', DEFAULT_RUNNING_POLICY)
+    if running_policy not in (POLICY_WAIT, POLICY_CONTINUE, POLICY_ABORT):
+        return JsonResponse({'message': 'invalid running_policy %s' % running_policy}, status=400)
+    expected = data.get('expected_spiders')
+    if expected is not None and not isinstance(expected, list):
+        return JsonResponse({'message': 'expected_spiders must be a list'}, status=400)
+    return _execute_deploy(
+        request, client_id, project_name,
+        keep_versions=max(keep_versions, 1),
+        running_policy=running_policy,
+        description=data.get('description'), version=version,
+        expected_spiders=expected,
+        enforce_data_compatibility=bool(data.get('enforce_data_compatibility', True)))
+
+
+@log_exception()
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def project_version_rollback(request, client_id, project_name, version):
+    """
+    roll a client back to a previously built version. The target egg is
+    re-uploaded with its original (immutable) version id, so the audit trail
+    stays stable. Health checks run exactly like a forward deploy.
+    """
+    try:
+        client = Client.objects.get(id=client_id)
+    except Client.DoesNotExist:
+        return JsonResponse({'message': 'client not found'}, status=404)
+    record = DeploymentRecord.objects.create(
+        client=client, client_name=client.name, project=project_name,
+        status=DeploymentRecord.DEPLOYING, operator=current_operator(request))
+    engine = DeploymentEngine(VersionStore())
+    try:
+        result = engine.rollback(client, project_name, version,
+                                 operator=current_operator(request), record=record)
+    except ConcurrentDeploymentError as e:
+        record.refresh_from_db()
+        return JsonResponse({'message': str(e), 'status': DeploymentRecord.REJECTED,
+                             'record_id': record.id}, status=409)
+    except DeploymentError as e:
+        if record.status == DeploymentRecord.DEPLOYING:
+            record.status = DeploymentRecord.FAILED
+            record.reason = e.reason
+            record.rollback_reason = truncate_text(sanitize_text(str(e)))
+            record.finished_at = timezone.now()
+            record.save()
+        return JsonResponse({'message': str(e), 'reason': record.reason,
+                             'record_id': record.id}, status=500)
+    if result.status != DeploymentRecord.ROLLBACK:
+        return JsonResponse(
+            {'message': result.rollback_reason or 'rollback failed',
+             'status': result.status, 'reason': result.reason,
+             'record_id': result.id}, status=500)
+    return JsonResponse({'result': '1', 'status': result.status,
+                         'version': result.version, 'record_id': result.id})
+
+
+@log_exception()
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def project_version_diff(request, project_name):
+    """
+    file-level diff between two immutable versions (?from=&to=)
+    """
+    from_version = request.GET.get('from')
+    to_version = request.GET.get('to')
+    if not from_version or not to_version:
+        return JsonResponse({'message': 'both from and to query params are required'}, status=400)
+    old_manifest = read_manifest(project_name, from_version)
+    new_manifest = read_manifest(project_name, to_version)
+    if not old_manifest or not new_manifest:
+        return JsonResponse({'message': 'one or both versions were pruned or never built'},
+                            status=404)
+    return JsonResponse(diff_manifests(old_manifest, new_manifest))
+
+
+@log_exception()
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def client_preflight(request, client_id):
+    """
+    standalone pre-flight health check of a scrapyd client (reachability plus
+    the currently deployed versions)
+    """
+    try:
+        client = Client.objects.get(id=client_id)
+    except Client.DoesNotExist:
+        return JsonResponse({'message': 'client not found'}, status=404)
+    project_name = request.GET.get('project')
+    checks = [check_daemon_health(client)]
+    remote = []
+    jobs = []
+    if project_name:
+        scrapyd = get_scrapyd(client)
+        remote = existing_versions(scrapyd, project_name)
+        jobs = get_running_jobs(scrapyd, project_name)
+    return JsonResponse({'passed': all(c['passed'] for c in checks),
+                         'checks': checks, 'versions': remote,
+                         'running_jobs': len(jobs), 'jobs': jobs})
+
+
+@log_exception()
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def deployment_audit(request):
+    """
+    audit query over deployment attempts. Filters: project, client_id, status,
+    version, operator; newest first, paginated with limit/offset.
+    """
+    queryset = DeploymentRecord.objects.all().order_by('-id')
+    filters = (('project', 'project'), ('client_id', 'client_id'), ('status', 'status'),
+               ('version', 'version'), ('operator', 'operator'), ('reason', 'reason'))
+    for param, field in filters:
+        value = request.GET.get(param)
+        if value:
+            queryset = queryset.filter(**{field: value})
+    try:
+        limit = min(int(request.GET.get('limit', 50)), 500)
+        offset = max(int(request.GET.get('offset', 0)), 0)
+    except ValueError:
+        return JsonResponse({'message': 'limit/offset must be integers'}, status=400)
+    total = queryset.count()
+    rows = list(queryset[offset:offset + limit])
+    data = [{
+        'id': row.id, 'client_id': row.client_id, 'client_name': row.client_name,
+        'project': row.project, 'version': row.version,
+        'previous_version': row.previous_version, 'status': row.status,
+        'reason': row.reason, 'diff': json.loads(row.diff) if row.diff else None,
+        'health_checks': json.loads(row.health_checks) if row.health_checks else None,
+        'rollback_reason': row.rollback_reason,
+        'running_task_policy': row.running_task_policy,
+        'running_jobs': row.running_jobs, 'operator': row.operator,
+        'log_path': row.log_path, 'started_at': row.started_at,
+        'finished_at': row.finished_at, 'created_at': row.created_at,
+    } for row in rows]
+    return JsonResponse({'result': '1', 'total': total, 'limit': limit,
+                         'offset': offset, 'data': data})
+
+
+@log_exception()
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def deployment_audit_detail(request, record_id):
+    """single audit record including the full (bounded, sanitized) log"""
+    try:
+        row = DeploymentRecord.objects.get(id=record_id)
+    except DeploymentRecord.DoesNotExist:
+        return JsonResponse({'message': 'record not found'}, status=404)
+    data = model_to_dict(row)
+    for key in ('diff', 'health_checks'):
+        if data.get(key):
+            try:
+                data[key] = json.loads(data[key])
+            except (ValueError, TypeError):
+                pass
+    return JsonResponse(data)
 
 
 @log_exception()
